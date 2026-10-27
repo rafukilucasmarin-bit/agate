@@ -1,0 +1,104 @@
+#!/bin/bash
+# Agate Loader - postinstall del .pkg de macOS.
+# 1) Pregunta qué "Geometry Dash.app" quieres modificar (selector de archivos).
+# 2) Copia TODO dentro de esa app (igual que el instalador oficial de Geode):
+#      Contents/Frameworks/{Geode.dylib, GeodeBootstrapper.dylib, libfmod.dylib (sustituto)}
+#      Contents/Frameworks/restore_fmod.dylib       <- copia del libfmod original
+#      Contents/geode/mods/agate.autoport.geode      <- mod que lanza el actualizador
+#      Contents/Resources/agate/{agate-autoport, uninstall.sh}
+# Si algo falla, restaura el libfmod original y no deja la app a medias.
+set -euo pipefail
+
+SHARE="/usr/local/share/agate"
+PAYLOAD="$SHARE/payload"
+TOOL="$SHARE/tool"
+LOG="/var/log/agate-install.log"
+exec > >(tee -a "$LOG") 2>&1
+echo "=== Agate postinstall $(date) ==="
+
+CONSOLE_USER="$(stat -f%Su /dev/console)"
+CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+USER_HOME="$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory | awk '{print $2}')"
+
+as_user() { launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" "$@"; }
+
+is_gd_app() { [ -d "$1/Contents/MacOS" ] && [ -f "$1/Contents/Frameworks/libfmod.dylib" ]; }
+
+dialog() {  # dialog "texto"
+  as_user osascript -e "display dialog \"$1\" with title \"Agate Loader\" buttons {\"OK\"} default button 1 with icon caution" >/dev/null 2>&1 || true
+}
+
+choose_app() {
+  local start="/Applications"
+  local steam="$USER_HOME/Library/Application Support/Steam/steamapps/common/Geometry Dash"
+  [ -d "$steam" ] && start="$steam"
+  as_user osascript <<OSA 2>/dev/null || true
+try
+  set theApp to choose file of type {"com.apple.application-bundle"} with prompt "Selecciona Geometry Dash.app (la app donde se instalará Agate / Geode)" default location (POSIX file "$start")
+  return POSIX path of theApp
+on error
+  return ""
+end try
+OSA
+}
+
+APP=""
+for attempt in 1 2 3; do
+  picked="$(choose_app | sed 's:/*$::')"
+  if [ -z "$picked" ]; then
+    echo "Instalación cancelada por el usuario."
+    exit 1
+  fi
+  if is_gd_app "$picked"; then APP="$picked"; break; fi
+  dialog "Esa app no parece ser Geometry Dash (falta Contents/Frameworks/libfmod.dylib). Elige Geometry Dash.app."
+done
+[ -n "$APP" ] || { echo "No se eligió una app válida."; exit 1; }
+echo "App elegida: $APP"
+
+for f in Geode.dylib GeodeBootstrapper.dylib libfmod.dylib; do
+  [ -f "$PAYLOAD/$f" ] || { echo "Falta $f en el payload del instalador"; dialog "El instalador está incompleto (falta $f)."; exit 1; }
+done
+[ -f "$TOOL/agate-autoport" ] && [ -f "$TOOL/agate.autoport.geode" ] || { echo "Falta el actualizador"; exit 1; }
+
+FW="$APP/Contents/Frameworks"
+REPLACED_FMOD=0
+rollback() {
+  echo "Error: restaurando libfmod original"
+  if [ "$REPLACED_FMOD" = 1 ] && [ -f "$FW/restore_fmod.dylib" ]; then
+    cp -p "$FW/restore_fmod.dylib" "$FW/libfmod.dylib" || true
+  fi
+}
+trap rollback ERR
+
+# --- 1. copia de seguridad del libfmod original (solo la primera vez) -------------------
+if [ ! -f "$FW/restore_fmod.dylib" ]; then
+  cp -p "$FW/libfmod.dylib" "$FW/restore_fmod.dylib"
+fi
+
+# --- 2. loader ----------------------------------------------------------------------------
+cp -f "$PAYLOAD/Geode.dylib"            "$FW/Geode.dylib"
+cp -f "$PAYLOAD/GeodeBootstrapper.dylib" "$FW/GeodeBootstrapper.dylib"
+REPLACED_FMOD=1
+cp -f "$PAYLOAD/libfmod.dylib"          "$FW/libfmod.dylib"
+
+# Recursos que el loader oficial incluya en geode/ (si existen)
+mkdir -p "$APP/Contents/geode/mods"
+if [ -d "$PAYLOAD/geode" ]; then cp -R "$PAYLOAD/geode/." "$APP/Contents/geode/"; fi
+
+# --- 3. lo propio de Agate ----------------------------------------------------------------
+cp -f "$TOOL/agate.autoport.geode" "$APP/Contents/geode/mods/agate.autoport.geode"
+mkdir -p "$APP/Contents/Resources/agate"
+cp -f "$TOOL/agate-autoport" "$APP/Contents/Resources/agate/agate-autoport"
+cp -f "$TOOL/uninstall.sh"   "$APP/Contents/Resources/agate/uninstall.sh"
+chmod 755 "$APP/Contents/Resources/agate/agate-autoport" "$APP/Contents/Resources/agate/uninstall.sh"
+
+# --- 4. permisos y cuarentena -------------------------------------------------------------
+OWNER="$(stat -f%Su "$APP")"
+chown -R "$OWNER" "$APP/Contents/geode" "$APP/Contents/Resources/agate"
+chown "$OWNER" "$FW/Geode.dylib" "$FW/GeodeBootstrapper.dylib" "$FW/libfmod.dylib" "$FW/restore_fmod.dylib"
+xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+
+trap - ERR
+echo "Agate instalado en: $APP"
+as_user osascript -e 'display notification "Instalado. Abre Geometry Dash desde Steam." with title "Agate Loader"' >/dev/null 2>&1 || true
+exit 0

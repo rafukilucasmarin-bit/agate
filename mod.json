@@ -1,0 +1,23 @@
+{
+  "geode": "@GEODE_VERSION@",
+  "gd": "*",
+  "version": "v1.0.0",
+  "id": "agate.autoport",
+  "name": "Agate AutoPort",
+  "developer": "Agate",
+  "description": "Mantiene tus mods compatibles con la última versión de Geometry Dash.",
+  "settings": {
+    "auto-update": {
+      "type": "bool",
+      "name": "Actualizar mods al abrir el juego",
+      "description": "Busca mods hechos para una versión anterior de GD y los actualiza.",
+      "default": true
+    },
+    "allow-build": {
+      "type": "bool",
+      "name": "Permitir recompilar desde código (experimental)",
+      "description": "Si el Index no tiene versión nueva de un mod, intenta compilarlo desde su repositorio. Ejecuta código de terceros en tu equipo.",
+      "default": false
+    }
+  }
+}
