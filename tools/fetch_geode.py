@@ -28,12 +28,11 @@ ASSET_RE = {
 }
 # Ficheros que DEBEN existir tras extraer (según la documentación del instalador oficial).
 # Win: según GeodeUpdater (reemplaza XInput1_4.dll, Geode.dll y recursos).
-# Mac: según el postinstall oficial (Geode.dylib + GeodeBootstrapper.dylib en Contents/Frameworks y un
-#      libfmod.dylib sustituto). Esto último viene de documentación secundaria: si el zip oficial no
-#      lo trae, el build FALLA a propósito para que alguien compare con installer/mac/Scripts/postinstall.
+# Mac: el zip oficial v5.11.2 contiene exactamente Geode.dylib y GeodeBootstrapper.dylib (comprobado en CI).
+#      No trae ningún libfmod.dylib: el bootstrapper es lo que se instala como libfmod (ver el postinstall).
 REQUIRED = {
     "win": ["Geode.dll", "XInput1_4.dll"],
-    "mac": ["Geode.dylib", "GeodeBootstrapper.dylib", "libfmod.dylib"],
+    "mac": ["Geode.dylib", "GeodeBootstrapper.dylib"],
 }
 
 
