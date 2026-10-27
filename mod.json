@@ -1,6 +1,6 @@
 {
   "geode": "@GEODE_VERSION@",
-  "gd": "*",
+  "gd": { "win": "*", "mac": "*" },
   "version": "v1.0.0",
   "id": "agate.autoport",
   "name": "Agate AutoPort",
