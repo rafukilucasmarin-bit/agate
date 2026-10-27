@@ -65,7 +65,8 @@ jobs:
                 | python -c "import json,sys;print(json.load(sys.stdin)['tag_name'])")
           echo "Versión de Geode: $TAG"
           echo "GEODE_TAG=$TAG" >> "$GITHUB_ENV"
-          sed -i.bak "s/@GEODE_VERSION@/$TAG/" mod.json && rm mod.json.bak
+          # El script CMake de Geode compara el texto exacto: mod.json lleva "5.11.2", sin la "v".
+          sed -i.bak "s/@GEODE_VERSION@/${TAG#v}/" mod.json && rm mod.json.bak
           cat mod.json
       - uses: geode-sdk/build-geode-mod@main
         with:
