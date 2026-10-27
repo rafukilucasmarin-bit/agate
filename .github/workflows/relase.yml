@@ -56,10 +56,17 @@ jobs:
         with: { python-version: "3.12" }
       - name: Fijar la versión de Geode en mod.json
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=$(python -c "import json,urllib.request as u;print(json.load(u.urlopen('https://api.geode-sdk.org/v1/loader/versions/latest?platform=win'))['payload']['tag'])")
+          # La versión oficial del loader/SDK es la última release de geode-sdk/geode en GitHub.
+          TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                https://api.github.com/repos/geode-sdk/geode/releases/latest \
+                | python -c "import json,sys;print(json.load(sys.stdin)['tag_name'])")
+          echo "Versión de Geode: $TAG"
           echo "GEODE_TAG=$TAG" >> "$GITHUB_ENV"
           sed -i.bak "s/@GEODE_VERSION@/$TAG/" mod.json && rm mod.json.bak
+          cat mod.json
       - uses: geode-sdk/build-geode-mod@main
         with:
           sdk: ${{ env.GEODE_TAG }}
