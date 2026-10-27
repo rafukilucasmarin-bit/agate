@@ -1,0 +1,145 @@
+name: Build installers
+
+# Genera:  Agate-Setup-<ver>.exe (Windows, NSIS)  y  Agate-Loader-<ver>.pkg (macOS)
+# NOTA: este workflow NO se pudo ejecutar donde se escribió. Los pasos del mod están adaptados de la
+# plantilla example-mod de Geode; si cambian sus inputs, ajústalos según esa plantilla.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+
+env:
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.0.0-dev' }}
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m unittest discover -s autoport/tests -v
+
+  autoport:
+    needs: tests
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, name: win, arch: "" }
+          - { os: macos-14,       name: mac, arch: "--target-arch universal2" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyinstaller
+      - run: pyinstaller --onefile --name agate-autoport ${{ matrix.arch }} --paths autoport autoport/entry.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autoport-${{ matrix.name }}
+          path: dist/agate-autoport*
+
+  mod:
+    # Compilación del mod disparador, adaptada de la plantilla multi-plataforma de Geode.
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { name: Windows, os: windows-latest }
+          - { name: macOS,   os: macos-latest }
+    runs-on: ${{ matrix.config.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Fijar la versión de Geode en mod.json
+        shell: bash
+        run: |
+          TAG=$(python -c "import json,urllib.request as u;print(json.load(u.urlopen('https://api.geode-sdk.org/v1/loader/versions/latest?platform=win'))['payload']['tag'])")
+          echo "GEODE_TAG=$TAG" >> "$GITHUB_ENV"
+          sed -i.bak "s/@GEODE_VERSION@/$TAG/" mod.json && rm mod.json.bak
+      - uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: ${{ env.GEODE_TAG }}
+          combine: true
+
+  package-mod:
+    needs: mod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: geode-sdk/build-geode-mod/combine@main
+        id: combine
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mod
+          path: ${{ steps.combine.outputs.build-output }}
+
+  installer-windows:
+    needs: [autoport, package-mod]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@v4
+        with: { name: autoport-win, path: art/autoport }
+      - uses: actions/download-artifact@v4
+        with: { name: mod, path: art/mod }
+      - run: choco install nsis -y --no-progress
+      - name: Descargar Geode oficial y validar su contenido
+        run: python tools/fetch_geode.py --out build
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: Lista de desinstalación
+        run: python tools/gen_nsis_uninstall.py build/payload/win build/uninstall-list.nsh
+      - name: Compilar el instalador
+        shell: pwsh
+        run: |
+          $mod = (Get-ChildItem art/mod -Recurse -Filter "agate.autoport.geode" | Select-Object -First 1).FullName
+          & "C:\Program Files (x86)\NSIS\makensis.exe" `
+            "/DVERSION=$env:VERSION" `
+            "/DPAYLOAD_DIR=$PWD\build\payload\win" `
+            "/DAUTOPORT_EXE=$PWD\art\autoport\agate-autoport.exe" `
+            "/DAUTOPORT_MOD=$mod" `
+            "/DUNINSTALL_LIST=$PWD\build\uninstall-list.nsh" `
+            "/DOUTFILE=$PWD\Agate-Setup-$env:VERSION.exe" `
+            installer/windows/agate.nsi
+      - uses: actions/upload-artifact@v4
+        with: { name: installer-windows, path: "Agate-Setup-*.exe" }
+
+  installer-macos:
+    needs: [autoport, package-mod]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@v4
+        with: { name: autoport-mac, path: art/autoport }
+      - uses: actions/download-artifact@v4
+        with: { name: mod, path: art/mod }
+      - name: Descargar Geode oficial y validar su contenido
+        run: python tools/fetch_geode.py --out build
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: Construir el .pkg
+        env:
+          MACOS_INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}  # opcional (firma)
+        run: |
+          MOD=$(find art/mod -name 'agate.autoport.geode' | head -n1)
+          chmod +x art/autoport/agate-autoport
+          installer/macos/build-pkg.sh build/payload/mac art/autoport/agate-autoport "$MOD" \
+            "${VERSION#v}" "Agate-Loader-${VERSION#v}.pkg"
+      - uses: actions/upload-artifact@v4
+        with: { name: installer-macos, path: "Agate-Loader-*.pkg" }
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [installer-windows, installer-macos]
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: out, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with: { files: "out/*" }
