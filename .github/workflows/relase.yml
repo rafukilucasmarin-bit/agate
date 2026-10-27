@@ -136,7 +136,7 @@ jobs:
         run: |
           MOD=$(find art/mod -name 'agate.autoport.geode' | head -n1)
           chmod +x art/autoport/agate-autoport
-          installer/macos/build-pkg.sh build/payload/mac art/autoport/agate-autoport "$MOD" \
+          bash installer/macos/build-pkg.sh build/payload/mac art/autoport/agate-autoport "$MOD" \
             "${VERSION#v}" "Agate-Loader-${VERSION#v}.pkg"
       - uses: actions/upload-artifact@v4
         with: { name: installer-macos, path: "Agate-Loader-*.pkg" }
