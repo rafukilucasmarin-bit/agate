@@ -2,7 +2,8 @@
 # Agate Loader - postinstall del .pkg de macOS.
 # 1) Pregunta qué "Geometry Dash.app" quieres modificar (selector de archivos).
 # 2) Copia TODO dentro de esa app (igual que el instalador oficial de Geode):
-#      Contents/Frameworks/{Geode.dylib, GeodeBootstrapper.dylib, libfmod.dylib (sustituto)}
+#      Contents/Frameworks/{Geode.dylib, GeodeBootstrapper.dylib}
+#      Contents/Frameworks/libfmod.dylib            <- copia de GeodeBootstrapper.dylib (hace de libfmod y carga Geode)
 #      Contents/Frameworks/restore_fmod.dylib       <- copia del libfmod original
 #      Contents/geode/mods/agate.autoport.geode      <- mod que lanza el actualizador
 #      Contents/Resources/agate/{agate-autoport, uninstall.sh}
@@ -55,7 +56,7 @@ done
 [ -n "$APP" ] || { echo "No se eligió una app válida."; exit 1; }
 echo "App elegida: $APP"
 
-for f in Geode.dylib GeodeBootstrapper.dylib libfmod.dylib; do
+for f in Geode.dylib GeodeBootstrapper.dylib; do
   [ -f "$PAYLOAD/$f" ] || { echo "Falta $f en el payload del instalador"; dialog "El instalador está incompleto (falta $f)."; exit 1; }
 done
 [ -f "$TOOL/agate-autoport" ] && [ -f "$TOOL/agate.autoport.geode" ] || { echo "Falta el actualizador"; exit 1; }
@@ -76,10 +77,12 @@ if [ ! -f "$FW/restore_fmod.dylib" ]; then
 fi
 
 # --- 2. loader ----------------------------------------------------------------------------
-cp -f "$PAYLOAD/Geode.dylib"            "$FW/Geode.dylib"
+cp -f "$PAYLOAD/Geode.dylib"             "$FW/Geode.dylib"
 cp -f "$PAYLOAD/GeodeBootstrapper.dylib" "$FW/GeodeBootstrapper.dylib"
+# El juego carga libfmod.dylib al arrancar; el bootstrapper ocupa su lugar (el original queda como
+# restore_fmod.dylib) y desde ahí carga Geode.dylib.  [Deducido de la estructura del zip oficial.]
 REPLACED_FMOD=1
-cp -f "$PAYLOAD/libfmod.dylib"          "$FW/libfmod.dylib"
+cp -f "$PAYLOAD/GeodeBootstrapper.dylib" "$FW/libfmod.dylib"
 
 # Recursos que el loader oficial incluya en geode/ (si existen)
 mkdir -p "$APP/Contents/geode/mods"
