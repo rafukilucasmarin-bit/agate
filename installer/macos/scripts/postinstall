@@ -1,107 +1,139 @@
-#!/bin/bash
-# Agate Loader - postinstall del .pkg de macOS.
-# 1) Pregunta qué "Geometry Dash.app" quieres modificar (selector de archivos).
-# 2) Copia TODO dentro de esa app (igual que el instalador oficial de Geode):
-#      Contents/Frameworks/{Geode.dylib, GeodeBootstrapper.dylib}
-#      Contents/Frameworks/libfmod.dylib            <- copia de GeodeBootstrapper.dylib (hace de libfmod y carga Geode)
-#      Contents/Frameworks/restore_fmod.dylib       <- copia del libfmod original
-#      Contents/geode/mods/agate.autoport.geode      <- mod que lanza el actualizador
-#      Contents/Resources/agate/{agate-autoport, uninstall.sh}
-# Si algo falla, restaura el libfmod original y no deja la app a medias.
-set -euo pipefail
+#!/usr/bin/env python3
+"""Descarga la última release OFICIAL de Geode (github.com/geode-sdk/geode) y deja los ficheros del
+loader en build/payload/<plataforma>. Se ejecuta en CI al empaquetar los instaladores.
 
-SHARE="/usr/local/share/agate"
-PAYLOAD="$SHARE/payload"
-TOOL="$SHARE/tool"
-LOG="/var/log/agate-install.log"
-exec > >(tee -a "$LOG") 2>&1
-echo "=== Agate postinstall $(date) ==="
+  win : se extrae el zip oficial (geode-vX-win.zip).
+  mac : el zip oficial NO basta (no trae el libfmod.dylib sustituto ni los recursos). El contenido
+        completo sale del instalador oficial .pkg: se expande con `pkgutil` (solo existe en macOS) y se
+        usa su carpeta Payload/ (Geode.dylib, GeodeBootstrapper.dylib, libfmod.dylib, resources/).
 
-CONSOLE_USER="$(stat -f%Su /dev/console)"
-CONSOLE_UID="$(id -u "$CONSOLE_USER")"
-USER_HOME="$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory | awk '{print $2}')"
+Es deliberadamente estricto: si una release cambia de forma, FALLA en vez de empaquetar algo roto.
 
-as_user() { launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" "$@"; }
+Uso: python tools/fetch_geode.py --out build [--platforms win,mac] [--tag v5.x.y]
+"""
+from __future__ import annotations
 
-is_gd_app() { [ -d "$1/Contents/MacOS" ] && [ -f "$1/Contents/Frameworks/libfmod.dylib" ]; }
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+import zipfile
+from pathlib import Path
 
-dialog() {  # dialog "texto"
-  as_user osascript -e "display dialog \"$1\" with title \"Agate Loader\" buttons {\"OK\"} default button 1 with icon caution" >/dev/null 2>&1 || true
+REPO = "geode-sdk/geode"
+API = f"https://api.github.com/repos/{REPO}/releases"
+ASSET_RE = {
+    "win": re.compile(r"^geode-v[\w.\-]+-win\.zip$", re.I),
+    "mac": re.compile(r"^geode-v[\w.\-]+-mac\.zip$", re.I),                 # zip: ya no se usa para el instalador
+    "macpkg": re.compile(r"^geode-installer-v[\w.\-]+-mac\.pkg$", re.I),    # instalador oficial: fuente del payload mac
+}
+# Win: según GeodeUpdater (reemplaza XInput1_4.dll, Geode.dll y recursos).
+# Mac: comprobado contra el instalador oficial v5.11.2 (su Payload/ y su Scripts/postinstall).
+REQUIRED = {
+    "win": ["Geode.dll", "XInput1_4.dll"],
+    "mac": ["Geode.dylib", "GeodeBootstrapper.dylib", "libfmod.dylib", "mod.json"],
 }
 
-choose_app() {
-  local start="/Applications"
-  local steam="$USER_HOME/Library/Application Support/Steam/steamapps/common/Geometry Dash"
-  [ -d "$steam" ] && start="$steam"
-  as_user osascript <<OSA 2>/dev/null || true
-try
-  set theApp to choose file of type {"com.apple.application-bundle"} with prompt "Selecciona Geometry Dash.app (la app donde se instalará Agate / Geode)" default location (POSIX file "$start")
-  return POSIX path of theApp
-on error
-  return ""
-end try
-OSA
-}
 
-APP=""
-for attempt in 1 2 3; do
-  picked="$(choose_app | sed 's:/*$::')"
-  if [ -z "$picked" ]; then
-    echo "Instalación cancelada por el usuario."
-    exit 1
-  fi
-  if is_gd_app "$picked"; then APP="$picked"; break; fi
-  dialog "Esa app no parece ser Geometry Dash (falta Contents/Frameworks/libfmod.dylib). Elige Geometry Dash.app."
-done
-[ -n "$APP" ] || { echo "No se eligió una app válida."; exit 1; }
-echo "App elegida: $APP"
+def http_json(url: str):
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "agate-ci"})
+    if tok := os.environ.get("GITHUB_TOKEN"):
+        req.add_header("Authorization", f"Bearer {tok}")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
 
-for f in Geode.dylib GeodeBootstrapper.dylib; do
-  [ -f "$PAYLOAD/$f" ] || { echo "Falta $f en el payload del instalador"; dialog "El instalador está incompleto (falta $f)."; exit 1; }
-done
-[ -f "$TOOL/agate-autoport" ] && [ -f "$TOOL/agate.autoport.geode" ] || { echo "Falta el actualizador"; exit 1; }
 
-FW="$APP/Contents/Frameworks"
-REPLACED_FMOD=0
-rollback() {
-  echo "Error: restaurando libfmod original"
-  if [ "$REPLACED_FMOD" = 1 ] && [ -f "$FW/restore_fmod.dylib" ]; then
-    cp -p "$FW/restore_fmod.dylib" "$FW/libfmod.dylib" || true
-  fi
-}
-trap rollback ERR
+def pick_asset(assets: list[dict], key: str) -> dict:
+    hits = [a for a in assets if ASSET_RE[key].match(a["name"])]
+    if len(hits) != 1:
+        names = ", ".join(a["name"] for a in assets)
+        raise SystemExit(f"No pude elegir un único asset '{key}' (candidatos: {len(hits)}). "
+                         f"Assets de la release: {names}. Ajusta ASSET_RE en tools/fetch_geode.py.")
+    return hits[0]
 
-# --- 1. copia de seguridad del libfmod original (solo la primera vez) -------------------
-if [ ! -f "$FW/restore_fmod.dylib" ]; then
-  cp -p "$FW/libfmod.dylib" "$FW/restore_fmod.dylib"
-fi
 
-# --- 2. loader ----------------------------------------------------------------------------
-cp -f "$PAYLOAD/Geode.dylib"             "$FW/Geode.dylib"
-cp -f "$PAYLOAD/GeodeBootstrapper.dylib" "$FW/GeodeBootstrapper.dylib"
-# El juego carga libfmod.dylib al arrancar; el bootstrapper ocupa su lugar (el original queda como
-# restore_fmod.dylib) y desde ahí carga Geode.dylib.  [Deducido de la estructura del zip oficial.]
-REPLACED_FMOD=1
-cp -f "$PAYLOAD/GeodeBootstrapper.dylib" "$FW/libfmod.dylib"
+def download(url: str, dest: Path, digest: str | None) -> None:
+    h = hashlib.sha256()
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "agate-ci"}), timeout=300) as r, \
+            open(dest, "wb") as f:
+        while chunk := r.read(1 << 16):
+            h.update(chunk)
+            f.write(chunk)
+    if digest and digest.startswith("sha256:") and h.hexdigest() != digest.split(":", 1)[1]:
+        raise SystemExit(f"SHA-256 de {dest.name} no coincide con el publicado por GitHub")
 
-# Recursos que el loader oficial incluya en geode/ (si existen)
-mkdir -p "$APP/Contents/geode/mods"
-if [ -d "$PAYLOAD/geode" ]; then cp -R "$PAYLOAD/geode/." "$APP/Contents/geode/"; fi
 
-# --- 3. lo propio de Agate ----------------------------------------------------------------
-cp -f "$TOOL/agate.autoport.geode" "$APP/Contents/geode/mods/agate.autoport.geode"
-mkdir -p "$APP/Contents/Resources/agate"
-cp -f "$TOOL/agate-autoport" "$APP/Contents/Resources/agate/agate-autoport"
-cp -f "$TOOL/uninstall.sh"   "$APP/Contents/Resources/agate/uninstall.sh"
-chmod 755 "$APP/Contents/Resources/agate/agate-autoport" "$APP/Contents/Resources/agate/uninstall.sh"
+def safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
+    root = dest.resolve()
+    for m in zf.namelist():
+        if not (root / m).resolve().is_relative_to(root):
+            raise SystemExit(f"entrada peligrosa en el zip: {m}")
+    zf.extractall(dest)
 
-# --- 4. permisos y cuarentena -------------------------------------------------------------
-OWNER="$(stat -f%Su "$APP")"
-chown -R "$OWNER" "$APP/Contents/geode" "$APP/Contents/Resources/agate"
-chown "$OWNER" "$FW/Geode.dylib" "$FW/GeodeBootstrapper.dylib" "$FW/libfmod.dylib" "$FW/restore_fmod.dylib"
-xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 
-trap - ERR
-echo "Agate instalado en: $APP"
-as_user osascript -e 'display notification "Instalado. Abre Geometry Dash desde Steam." with title "Agate Loader"' >/dev/null 2>&1 || true
-exit 0
+def check_layout(platform: str, payload: Path) -> None:
+    present = {p.name.lower() for p in payload.rglob("*") if p.is_file()}
+    missing = [f for f in REQUIRED[platform] if f.lower() not in present]
+    if missing:
+        listing = sorted(str(p.relative_to(payload)) for p in payload.rglob("*"))[:40]
+        raise SystemExit(f"Layout inesperado en el payload de {platform}: faltan {missing}.\n"
+                         f"Contenido: {listing}\nRevisa installer/ del repo oficial de Geode y ajusta REQUIRED.")
+
+
+def expand_mac_pkg(pkg: Path, payload: Path, run=subprocess.run) -> None:
+    """Expande el .pkg oficial y copia su Payload/ a `payload`."""
+    if run is subprocess.run and sys.platform != "darwin":
+        raise SystemExit("Extraer el .pkg oficial requiere macOS (pkgutil): ejecuta este paso en el runner de macOS.")
+    expanded = pkg.parent / (pkg.stem + ".expanded")
+    shutil.rmtree(expanded, ignore_errors=True)   # pkgutil exige que el destino no exista
+    run(["pkgutil", "--expand-full", str(pkg), str(expanded)], check=True)
+    src = expanded / "Payload"
+    if not src.is_dir():
+        raise SystemExit(f"El .pkg oficial no tiene Payload/ (hay: {[p.name for p in expanded.iterdir()]})")
+    shutil.rmtree(payload, ignore_errors=True)
+    shutil.copytree(src, payload)
+    check_layout("mac", payload)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", type=Path, default=Path("build"))
+    ap.add_argument("--tag")
+    ap.add_argument("--platforms", default="win,mac", help="lista separada por comas")
+    args = ap.parse_args()
+
+    rel = http_json(f"{API}/tags/{args.tag}" if args.tag else f"{API}/latest")
+    print(f"Release oficial de Geode: {rel['tag_name']}")
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "geode-release.json").write_text(json.dumps({"tag": rel["tag_name"]}))
+
+    for platform in [p.strip() for p in args.platforms.split(",") if p.strip()]:
+        payload = args.out / "payload" / platform
+        if platform == "win":
+            asset = pick_asset(rel["assets"], "win")
+            print(f"  win: {asset['name']}")
+            zip_path = args.out / asset["name"]
+            download(asset["browser_download_url"], zip_path, asset.get("digest"))
+            shutil.rmtree(payload, ignore_errors=True)
+            payload.mkdir(parents=True)
+            with zipfile.ZipFile(zip_path) as zf:
+                safe_extract(zf, payload)
+            check_layout("win", payload)
+        elif platform == "mac":
+            asset = pick_asset(rel["assets"], "macpkg")
+            print(f"  mac: {asset['name']}")
+            pkg_path = args.out / asset["name"]
+            download(asset["browser_download_url"], pkg_path, asset.get("digest"))
+            expand_mac_pkg(pkg_path, payload)
+        else:
+            raise SystemExit(f"plataforma desconocida: {platform}")
+    print("OK")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
