@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Descarga la última release OFICIAL de Geode (github.com/geode-sdk/geode) y extrae los
-ficheros del loader para Windows y macOS en build/payload/<plataforma>.
+"""Descarga la última release OFICIAL de Geode (github.com/geode-sdk/geode) y deja los ficheros del
+loader en build/payload/<plataforma>. Se ejecuta en CI al empaquetar los instaladores.
 
-Se ejecuta en CI al empaquetar los instaladores. Es deliberadamente estricto: si la release
-cambia de forma (nombres de assets, contenido del zip), FALLA en lugar de empaquetar algo roto.
+  win : se extrae el zip oficial (geode-vX-win.zip).
+  mac : el zip oficial NO basta (no trae el libfmod.dylib sustituto ni los recursos). El contenido
+        completo sale del instalador oficial .pkg: se expande con `pkgutil` (solo existe en macOS) y se
+        usa su carpeta Payload/ (Geode.dylib, GeodeBootstrapper.dylib, libfmod.dylib, resources/).
 
-Uso: python tools/fetch_geode.py --out build [--tag v5.x.y]
+Es deliberadamente estricto: si una release cambia de forma, FALLA en vez de empaquetar algo roto.
+
+Uso: python tools/fetch_geode.py --out build [--platforms win,mac] [--tag v5.x.y]
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import urllib.request
 import zipfile
@@ -24,15 +29,14 @@ REPO = "geode-sdk/geode"
 API = f"https://api.github.com/repos/{REPO}/releases"
 ASSET_RE = {
     "win": re.compile(r"^geode-v[\w.\-]+-win\.zip$", re.I),
-    "mac": re.compile(r"^geode-v[\w.\-]+-mac\.zip$", re.I),
+    "mac": re.compile(r"^geode-v[\w.\-]+-mac\.zip$", re.I),                 # zip: ya no se usa para el instalador
+    "macpkg": re.compile(r"^geode-installer-v[\w.\-]+-mac\.pkg$", re.I),    # instalador oficial: fuente del payload mac
 }
-# Ficheros que DEBEN existir tras extraer (según la documentación del instalador oficial).
 # Win: según GeodeUpdater (reemplaza XInput1_4.dll, Geode.dll y recursos).
-# Mac: el zip oficial v5.11.2 contiene exactamente Geode.dylib y GeodeBootstrapper.dylib (comprobado en CI).
-#      No trae ningún libfmod.dylib: el bootstrapper es lo que se instala como libfmod (ver el postinstall).
+# Mac: comprobado contra el instalador oficial v5.11.2 (su Payload/ y su Scripts/postinstall).
 REQUIRED = {
     "win": ["Geode.dll", "XInput1_4.dll"],
-    "mac": ["Geode.dylib", "GeodeBootstrapper.dylib"],
+    "mac": ["Geode.dylib", "GeodeBootstrapper.dylib", "libfmod.dylib", "mod.json"],
 }
 
 
@@ -44,11 +48,11 @@ def http_json(url: str):
         return json.load(r)
 
 
-def pick_asset(assets: list[dict], platform: str) -> dict:
-    hits = [a for a in assets if ASSET_RE[platform].match(a["name"])]
+def pick_asset(assets: list[dict], key: str) -> dict:
+    hits = [a for a in assets if ASSET_RE[key].match(a["name"])]
     if len(hits) != 1:
         names = ", ".join(a["name"] for a in assets)
-        raise SystemExit(f"No pude elegir un único asset '{platform}' (candidatos: {len(hits)}). "
+        raise SystemExit(f"No pude elegir un único asset '{key}' (candidatos: {len(hits)}). "
                          f"Assets de la release: {names}. Ajusta ASSET_RE en tools/fetch_geode.py.")
     return hits[0]
 
@@ -77,32 +81,57 @@ def check_layout(platform: str, payload: Path) -> None:
     missing = [f for f in REQUIRED[platform] if f.lower() not in present]
     if missing:
         listing = sorted(str(p.relative_to(payload)) for p in payload.rglob("*"))[:40]
-        raise SystemExit(f"Layout inesperado en el zip de {platform}: faltan {missing}.\n"
+        raise SystemExit(f"Layout inesperado en el payload de {platform}: faltan {missing}.\n"
                          f"Contenido: {listing}\nRevisa installer/ del repo oficial de Geode y ajusta REQUIRED.")
+
+
+def expand_mac_pkg(pkg: Path, payload: Path, run=subprocess.run) -> None:
+    """Expande el .pkg oficial y copia su Payload/ a `payload`."""
+    if run is subprocess.run and sys.platform != "darwin":
+        raise SystemExit("Extraer el .pkg oficial requiere macOS (pkgutil): ejecuta este paso en el runner de macOS.")
+    expanded = pkg.parent / (pkg.stem + ".expanded")
+    shutil.rmtree(expanded, ignore_errors=True)   # pkgutil exige que el destino no exista
+    run(["pkgutil", "--expand-full", str(pkg), str(expanded)], check=True)
+    src = expanded / "Payload"
+    if not src.is_dir():
+        raise SystemExit(f"El .pkg oficial no tiene Payload/ (hay: {[p.name for p in expanded.iterdir()]})")
+    shutil.rmtree(payload, ignore_errors=True)
+    shutil.copytree(src, payload)
+    check_layout("mac", payload)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=Path("build"))
     ap.add_argument("--tag")
+    ap.add_argument("--platforms", default="win,mac", help="lista separada por comas")
     args = ap.parse_args()
 
     rel = http_json(f"{API}/tags/{args.tag}" if args.tag else f"{API}/latest")
     print(f"Release oficial de Geode: {rel['tag_name']}")
-    (args.out).mkdir(parents=True, exist_ok=True)
+    args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "geode-release.json").write_text(json.dumps({"tag": rel["tag_name"]}))
 
-    for platform in ("win", "mac"):
-        asset = pick_asset(rel["assets"], platform)
-        zip_path = args.out / asset["name"]
-        print(f"  {platform}: {asset['name']}")
-        download(asset["browser_download_url"], zip_path, asset.get("digest"))
+    for platform in [p.strip() for p in args.platforms.split(",") if p.strip()]:
         payload = args.out / "payload" / platform
-        shutil.rmtree(payload, ignore_errors=True)
-        payload.mkdir(parents=True)
-        with zipfile.ZipFile(zip_path) as zf:
-            safe_extract(zf, payload)
-        check_layout(platform, payload)
+        if platform == "win":
+            asset = pick_asset(rel["assets"], "win")
+            print(f"  win: {asset['name']}")
+            zip_path = args.out / asset["name"]
+            download(asset["browser_download_url"], zip_path, asset.get("digest"))
+            shutil.rmtree(payload, ignore_errors=True)
+            payload.mkdir(parents=True)
+            with zipfile.ZipFile(zip_path) as zf:
+                safe_extract(zf, payload)
+            check_layout("win", payload)
+        elif platform == "mac":
+            asset = pick_asset(rel["assets"], "macpkg")
+            print(f"  mac: {asset['name']}")
+            pkg_path = args.out / asset["name"]
+            download(asset["browser_download_url"], pkg_path, asset.get("digest"))
+            expand_mac_pkg(pkg_path, payload)
+        else:
+            raise SystemExit(f"plataforma desconocida: {platform}")
     print("OK")
 
 
