@@ -97,7 +97,7 @@ jobs:
         with: { name: mod, path: art/mod }
       - run: choco install nsis -y --no-progress
       - name: Descargar Geode oficial y validar su contenido
-        run: python tools/fetch_geode.py --out build
+        run: python tools/fetch_geode.py --out build --platforms win
         env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
       - name: Lista de desinstalación
         run: python tools/gen_nsis_uninstall.py build/payload/win build/uninstall-list.nsh
@@ -128,48 +128,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: mod, path: art/mod }
       - name: Descargar Geode oficial y validar su contenido
-        run: python tools/fetch_geode.py --out build
+        run: python tools/fetch_geode.py --out build --platforms mac
         env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
-      - name: Diagnóstico de macOS (informativo, no bloquea)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          {
-            echo "##### Dependencias y reexports de los dylib oficiales"
-            for f in build/payload/mac/*.dylib; do
-              echo "=== $f"; file "$f"; otool -L "$f"
-              otool -l "$f" | grep -B1 -A4 -i "REEXPORT" || echo "(sin LC_REEXPORT_DYLIB)"
-              echo "--- símbolos FMOD exportados:"; nm -gU "$f" 2>/dev/null | grep -ci fmod || true
-            done
-            echo; echo "##### Instalador oficial de Geode para macOS"
-            python3 - <<'PY'
-          import json, os, urllib.request
-          req = urllib.request.Request("https://api.github.com/repos/geode-sdk/geode/releases/latest",
-              headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
-                       "Accept": "application/vnd.github+json", "User-Agent": "agate-ci"})
-          rel = json.load(urllib.request.urlopen(req))
-          names = [a["name"] for a in rel["assets"]]
-          print("assets:", names)
-          pkgs = [a for a in rel["assets"] if a["name"].endswith(".pkg")]
-          if pkgs:
-              urllib.request.urlretrieve(pkgs[0]["browser_download_url"], "official.pkg")
-              print("descargado:", pkgs[0]["name"])
-          PY
-            if [ -f official.pkg ]; then
-              pkgutil --expand-full official.pkg official-expanded
-              echo "--- ficheros:"; find official-expanded -type f | head -200
-              find official-expanded -path '*Scripts*' -type f | while read -r f; do
-                echo; echo "=== SCRIPT $f"; cat "$f"
-              done
-            fi
-          } 2>&1 | tee diagnostico.txt
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: diagnostico-macos
-          path: diagnostico.txt
-          if-no-files-found: ignore
       - name: Construir el .pkg
         env:
           MACOS_INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}  # opcional (firma)
